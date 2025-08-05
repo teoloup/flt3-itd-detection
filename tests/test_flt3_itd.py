@@ -13,6 +13,11 @@ from pathlib import Path
 # from config import FLT3Config
 # from main_module import FLT3ITDDetector
 
+def create_sample_config():
+    """Helper function to create a sample configuration for testing"""
+    # This will be implemented when we add actual tests
+    pass
+
 class TestFLT3Config(unittest.TestCase):
     """Test configuration handling"""
     
