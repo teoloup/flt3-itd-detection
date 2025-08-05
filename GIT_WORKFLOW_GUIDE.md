@@ -130,5 +130,50 @@ git push
 # 4. Done! ✅
 ```
 
+## 🏠 Moving Your Project & Repository Connection
+
+### How Git Knows Which Repository to Use
+```bash
+git remote -v  # Shows which GitHub repo you're connected to
+```
+Output: `origin https://github.com/teoloup/flt3-itd-detection`
+
+### Moving Your Project Folder
+✅ **SAFE**: Move entire project folder anywhere
+- The hidden `.git` folder moves with it
+- All Git history and connections preserved
+- Continue using same commands
+
+❌ **UNSAFE**: Copy only Python files without `.git` folder
+- Loses all Git history and GitHub connection
+- Would need to re-initialize Git
+
+### If You Want to Change GitHub Repository
+```bash
+# See current connection
+git remote -v
+
+# Change to different repository
+git remote set-url origin https://github.com/username/new-repo.git
+
+# Verify the change
+git remote -v
+```
+
+### Working from Multiple Computers
+```bash
+# On new computer, clone your repository
+git clone https://github.com/teoloup/flt3-itd-detection.git
+cd flt3-itd-detection
+
+# Make changes normally
+git add .
+git commit -m "changes from laptop"
+git push
+
+# On original computer, get the changes
+git pull
+```
+
 ---
 **Remember**: Practice makes perfect! Start with small changes and you'll get comfortable quickly. 🚀
