@@ -6,7 +6,7 @@ Thank you for your interest in contributing! This document provides guidelines f
 
 1. **Fork and Clone**
    ```bash
-   git clone https://github.com/yourusername/flt3-itd-detection.git
+   git clone https://github.com/teoloup/flt3-itd-detection.git
    cd flt3-itd-detection
    ```
 

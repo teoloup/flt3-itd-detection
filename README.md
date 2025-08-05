@@ -27,7 +27,7 @@ pip install -r requirements.txt
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/flt3-itd-detection.git
+git clone https://github.com/teoloup/flt3-itd-detection.git
 cd flt3-itd-detection
 
 # Install dependencies
@@ -120,5 +120,5 @@ Please see CONTRIBUTING.md for guidelines on contributing to this project.
 ## Support
 
 For issues and questions:
-- GitHub Issues: [Repository Issues](https://github.com/yourusername/flt3-itd-detection/issues)
-- Email: your.email@institution.edu
+- GitHub Issues: [Repository Issues](https://github.com/teoloup/flt3-itd-detection/issues)
+- Email: teoloup@gmail.com

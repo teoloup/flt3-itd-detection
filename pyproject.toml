@@ -9,7 +9,7 @@ description = "A comprehensive pipeline for detecting FLT3 Internal Tandem Dupli
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
-    {name = "Your Name", email = "your.email@institution.edu"}
+    {name = "teoloup", email = "teoloup@gmail.com"}
 ]
 keywords = ["bioinformatics", "genomics", "FLT3", "ITD", "nanopore", "variant-calling"]
 classifiers = [
@@ -43,9 +43,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/flt3-itd-detection"
-Repository = "https://github.com/yourusername/flt3-itd-detection.git"
-Issues = "https://github.com/yourusername/flt3-itd-detection/issues"
+Homepage = "https://github.com/teoloup/flt3-itd-detection"
+Repository = "https://github.com/teoloup/flt3-itd-detection.git"
+Issues = "https://github.com/teoloup/flt3-itd-detection/issues"
 
 [project.scripts]
 flt3-itd = "flt3_itd_pipeline:main"
