@@ -31,6 +31,7 @@ class FLT3Config:
     # Quality filters
     min_mapping_quality: int = 20
     min_read_length: int = 250
+    wt_tolerance: int = 20  # Wild-type size tolerance (±bp)
     
     # CIGAR detection parameters
     min_softclip_length: int = 50
@@ -127,6 +128,8 @@ Examples:
                         help='Minimum allele frequency (default: 0.01)')
     parser.add_argument('--max-candidates', type=int, default=50,
                         help='Maximum candidates to validate (default: 50)')
+    parser.add_argument('--wt-tolerance', type=int, default=20,
+                        help='Maximum wild-type tolerance (default: 20)')
     
     # Quality filters
     parser.add_argument('--min-mapping-quality', type=int, default=20,
@@ -175,6 +178,7 @@ def parse_arguments():
         min_mapping_quality=args.min_mapping_quality,
         min_read_length=args.min_read_length,
         min_softclip_length=args.min_softclip_length,
+        wt_tolerance=args.wt_tolerance,
         enable_softclip_fallback=not args.no_softclip_fallback,
         write_html=not args.no_html,
         write_vcf=not args.no_vcf,

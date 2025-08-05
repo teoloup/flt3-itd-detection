@@ -20,16 +20,36 @@ logger = logging.getLogger(__name__)
 class ReadSizeAnalyzer:
     """Analyze read size distribution to detect ITD signatures"""
     
-    def __init__(self, expected_wt_size: int = 336, min_itd_size: int = 30):
+    def __init__(self, expected_wt_size: int = 336, min_itd_size: int = 15, 
+                 wt_tolerance: int = 30, size_class_boundaries: Dict[str, int] = None,
+                 min_allele_frequency: float = 0.01):
         """
         Initialize analyzer
         
         Args:
             expected_wt_size: Expected wild-type amplicon size
             min_itd_size: Minimum ITD size to consider significant
+            wt_tolerance: Tolerance for wild-type size classification (±bp)
+            size_class_boundaries: Custom boundaries for size classes (optional)
+            min_allele_frequency: Minimum allele frequency for peak detection
         """
         self.expected_wt_size = expected_wt_size
         self.min_itd_size = min_itd_size
+        self.wt_tolerance = wt_tolerance
+        self.min_allele_frequency = min_allele_frequency
+        
+        # Default size class boundaries if not provided
+        if size_class_boundaries is None:
+            self.size_class_boundaries = {
+                'very_short_threshold': 20,
+                'short_threshold': 50,
+                'small_insertion_max': 100,  # Increased to cover small ITDs
+                'medium_itd_max': 200,       # Adjusted for better coverage
+                'large_itd_max': 400        # Increased for larger ITDs
+            }
+        else:
+            self.size_class_boundaries = size_class_boundaries
+            
         self.read_lengths = []
         self.analysis_results = {}
         
@@ -138,28 +158,37 @@ class ReadSizeAnalyzer:
     
     def _detect_size_peaks(self, lengths: np.ndarray) -> Dict:
         """Detect peaks in size distribution"""
-        # Create histogram
-        hist, bin_edges = np.histogram(lengths, bins=50)
+        # Create histogram with more bins for better resolution
+        data_range = lengths.max() - lengths.min()
+        num_bins = max(100, int(data_range / 2))  # At least 100 bins, or 2bp per bin
+        hist, bin_edges = np.histogram(lengths, bins=num_bins)
         bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-        
-        # Find peaks in histogram
-        peaks, properties = find_peaks(hist, height=len(lengths) * 0.01, distance=5)
+
+        # Apply slight smoothing to reduce noise
+        from scipy.ndimage import gaussian_filter1d
+        hist_smooth = gaussian_filter1d(hist.astype(float), sigma=1)
+
+        # Find peaks with improved sensitivity
+        min_peak_height = max(len(lengths) * self.min_allele_frequency * 0.5, 5)  # More sensitive threshold
+        peaks, properties = find_peaks(hist_smooth, height=min_peak_height, distance=5, prominence=2)
         
         peak_info = []
         for i, peak_idx in enumerate(peaks):
             peak_size = bin_centers[peak_idx]
-            peak_height = hist[peak_idx]
+            peak_height = hist[peak_idx]  # Use original histogram for actual counts
             peak_prominence = properties.get('prominences', [0])[i] if 'prominences' in properties else 0
-            
-            # Classify peak
-            if abs(peak_size - self.expected_wt_size) <= 20:
+
+            # Improved classification with better separation
+            wt_buffer = max(self.wt_tolerance // 3, 3)  # Even tighter WT classification
+
+            if abs(peak_size - self.expected_wt_size) <= wt_buffer:
                 peak_type = "wild_type"
-            elif peak_size > self.expected_wt_size + self.min_itd_size:
-                itd_size = int(peak_size - self.expected_wt_size)
+            elif peak_size >= self.expected_wt_size + self.min_itd_size:
+                itd_size = int(round(peak_size - self.expected_wt_size))
                 peak_type = f"potential_ITD_{itd_size}bp"
             else:
                 peak_type = "other"
-            
+
             peak_info.append({
                 'size': peak_size,
                 'height': peak_height,
@@ -167,15 +196,21 @@ class ReadSizeAnalyzer:
                 'type': peak_type,
                 'frequency': peak_height / len(lengths)
             })
-        
+
         # Sort by height (most prominent first)
         peak_info.sort(key=lambda x: x['height'], reverse=True)
-        
+
+        # Debug logging
+        logger.debug(f"Peak detection: found {len(peaks)} peaks")
+        for i, peak in enumerate(peak_info[:3]):
+            logger.debug(f"Peak {i+1}: {peak['size']:.1f}bp ({peak['height']} reads, {peak['frequency']*100:.1f}%) - {peak['type']}")
+
         return {
             'peaks': peak_info,
             'histogram': {
                 'bins': bin_centers.tolist(),
-                'counts': hist.tolist()
+                'counts': hist.tolist(),
+                'smooth_counts': hist_smooth.tolist()
             }
         }
     
@@ -183,7 +218,7 @@ class ReadSizeAnalyzer:
         """Detect ITD signatures in read length distribution"""
         
         # Count reads in different size ranges (ensuring no overlap)
-        wt_range = (self.expected_wt_size - 30, self.expected_wt_size + 30)
+        wt_range = (self.expected_wt_size - self.wt_tolerance, self.expected_wt_size + self.wt_tolerance)
         wt_reads = np.sum((lengths >= wt_range[0]) & (lengths <= wt_range[1]))
         
         # Look for reads longer than WT + minimum ITD size (non-overlapping with WT range)
@@ -194,15 +229,20 @@ class ReadSizeAnalyzer:
         total_reads = len(lengths)
         estimated_itd_frequency = potential_itd_reads / total_reads if total_reads > 0 else 0
         
-        # Size classes for detailed analysis (ensuring no overlaps)
+        # Size classes for detailed analysis (ensuring no overlap)
+        boundaries = self.size_class_boundaries
         size_classes = {
-            'very_short': np.sum(lengths < self.expected_wt_size - 50),
-            'short': np.sum((lengths >= self.expected_wt_size - 50) & (lengths < self.expected_wt_size - 30)),
+            'very_short': np.sum(lengths < self.expected_wt_size - boundaries['very_short_threshold']),
+            'short': np.sum((lengths >= self.expected_wt_size - boundaries['very_short_threshold']) & 
+                           (lengths < self.expected_wt_size - boundaries['short_threshold'])),
             'wild_type': wt_reads,
-            'small_insertion': np.sum((lengths > self.expected_wt_size + 30) & (lengths <= self.expected_wt_size + 60)),
-            'medium_itd': np.sum((lengths > self.expected_wt_size + 60) & (lengths <= self.expected_wt_size + 150)),
-            'large_itd': np.sum((lengths > self.expected_wt_size + 150) & (lengths <= self.expected_wt_size + 300)),
-            'very_large_itd': np.sum(lengths > self.expected_wt_size + 300)
+            'small_insertion': np.sum((lengths > wt_range[1]) & 
+                                     (lengths <= self.expected_wt_size + boundaries['small_insertion_max'])),
+            'medium_itd': np.sum((lengths > self.expected_wt_size + boundaries['small_insertion_max']) & 
+                                (lengths <= self.expected_wt_size + boundaries['medium_itd_max'])),
+            'large_itd': np.sum((lengths > self.expected_wt_size + boundaries['medium_itd_max']) & 
+                               (lengths <= self.expected_wt_size + boundaries['large_itd_max'])),
+            'very_large_itd': np.sum(lengths > self.expected_wt_size + boundaries['large_itd_max'])
         }
         
         # ITD size distribution (using the corrected threshold)
@@ -307,20 +347,21 @@ class ReadSizeAnalyzer:
                 # Create class labels with size ranges
                 class_labels_with_ranges = []
                 for class_name in classes:
+                    boundaries = self.size_class_boundaries
                     if class_name == 'very_short':
-                        range_str = f"<{self.expected_wt_size - 50}"
+                        range_str = f"<{self.expected_wt_size - boundaries['very_short_threshold']}"
                     elif class_name == 'short':
-                        range_str = f"{self.expected_wt_size - 50}-{self.expected_wt_size - 30}"
+                        range_str = f"{self.expected_wt_size - boundaries['very_short_threshold']}-{self.expected_wt_size - boundaries['short_threshold']}"
                     elif class_name == 'wild_type':
-                        range_str = f"{self.expected_wt_size - 30}-{self.expected_wt_size + 30}"
+                        range_str = f"{self.expected_wt_size - self.wt_tolerance}-{self.expected_wt_size + self.wt_tolerance}"
                     elif class_name == 'small_insertion':
-                        range_str = f"{self.expected_wt_size + 31}-{self.expected_wt_size + 60}"
+                        range_str = f"{self.expected_wt_size + self.wt_tolerance + 1}-{self.expected_wt_size + boundaries['small_insertion_max']}"
                     elif class_name == 'medium_itd':
-                        range_str = f"{self.expected_wt_size + 61}-{self.expected_wt_size + 150}"
+                        range_str = f"{self.expected_wt_size + boundaries['small_insertion_max'] + 1}-{self.expected_wt_size + boundaries['medium_itd_max']}"
                     elif class_name == 'large_itd':
-                        range_str = f"{self.expected_wt_size + 151}-{self.expected_wt_size + 300}"
+                        range_str = f"{self.expected_wt_size + boundaries['medium_itd_max'] + 1}-{self.expected_wt_size + boundaries['large_itd_max']}"
                     elif class_name == 'very_large_itd':
-                        range_str = f">{self.expected_wt_size + 300}"
+                        range_str = f">{self.expected_wt_size + boundaries['large_itd_max']}"
                     else:
                         range_str = ""
                     
@@ -415,7 +456,7 @@ class ReadSizeAnalyzer:
             ax2 = axes[1]
             if itd_sigs['itd_size_stats'] and itd_sigs['itd_size_stats']['count'] > 0:
                 # Use the same threshold logic as in _detect_itd_signatures
-                wt_range = (self.expected_wt_size - 30, self.expected_wt_size + 30)
+                wt_range = (self.expected_wt_size - self.wt_tolerance, self.expected_wt_size + self.wt_tolerance)
                 itd_threshold = max(wt_range[1] + 1, self.expected_wt_size + self.min_itd_size)
                 itd_reads_full = lengths[lengths >= itd_threshold]
                 itd_sizes = itd_reads_full - self.expected_wt_size
@@ -484,15 +525,29 @@ class ReadSizeAnalyzer:
             peaks = self.analysis_results['peaks']['peaks']
             if peaks:
                 report.append(f"\nSIZE PEAKS DETECTED:")
-                for i, peak in enumerate(peaks[:5]):  # Top 5 peaks
-                    report.append(f"  Peak {i+1}: {peak['size']:.1f} bp ({peak['frequency']*100:.1f}%) - {peak['type']}")
+                report.append(f"  Total peaks found: {len(peaks)}")
+
+                # Show all peaks, not just top 5
+                for i, peak in enumerate(peaks):
+                    prominence_indicator = " (high prominence)" if peak['prominence'] > 10 else ""
+                    report.append(f"  Peak {i+1}: {peak['size']:.1f} bp ({peak['height']:,} reads, {peak['frequency']*100:.1f}%){prominence_indicator} - {peak['type']}")
+
+                # Highlight ITD peaks specifically
+                itd_peaks = [p for p in peaks if 'ITD' in p['type']]
+                if itd_peaks:
+                    report.append(f"\n  ITD PEAKS SUMMARY:")
+                    for peak in itd_peaks:
+                        itd_size = peak['type'].replace('potential_ITD_', '').replace('bp', '')
+                        report.append(f"    {itd_size}bp ITD: {peak['size']:.1f} bp ({peak['height']:,} reads, {peak['frequency']*100:.1f}%)")
         
         report.append("\n" + "=" * 60)
         
         return "\n".join(report)
 
 
-def analyze_read_sizes(input_file: str, output_dir: str, expected_wt_size: int = 336) -> Dict:
+def analyze_read_sizes(input_file: str, output_dir: str, expected_wt_size: int = 336, 
+                     wt_tolerance: int = 30, min_allele_frequency: float = 0.01,
+                     sample_name: str = "Sample") -> Dict:
     """
     Main function to analyze read sizes and generate plots
     
@@ -500,11 +555,14 @@ def analyze_read_sizes(input_file: str, output_dir: str, expected_wt_size: int =
         input_file: Path to FASTQ or BAM file
         output_dir: Directory to save output files
         expected_wt_size: Expected wild-type amplicon size
+        wt_tolerance: Tolerance for wild-type size classification (±bp)
+        min_allele_frequency: Minimum allele frequency for peak detection
         
     Returns:
         Analysis results dictionary
     """
-    analyzer = ReadSizeAnalyzer(expected_wt_size=expected_wt_size)
+    analyzer = ReadSizeAnalyzer(expected_wt_size=expected_wt_size, wt_tolerance=wt_tolerance, 
+                               min_allele_frequency=min_allele_frequency)
     
     # Determine file type and analyze
     if input_file.lower().endswith(('.fastq', '.fq', '.fastq.gz', '.fq.gz')):
@@ -522,8 +580,8 @@ def analyze_read_sizes(input_file: str, output_dir: str, expected_wt_size: int =
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
-    # Generate plots
-    base_name = Path(input_file).stem
+    # Generate plots with sample name prefix
+    base_name = f"{sample_name}_trimmed"
     
     # Main size distribution plot
     dist_plot = output_path / f"{base_name}_size_distribution.png"
@@ -546,21 +604,5 @@ def analyze_read_sizes(input_file: str, output_dir: str, expected_wt_size: int =
 
 
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Analyze read size distribution for ITD detection")
-    parser.add_argument("input_file", help="Input FASTQ or BAM file")
-    parser.add_argument("-o", "--output", required=True, help="Output directory")
-    parser.add_argument("--expected-wt-size", type=int, default=336, help="Expected wild-type size (default: 336)")
-    parser.add_argument("--min-itd-size", type=int, default=30, help="Minimum ITD size (default: 30)")
-    
-    args = parser.parse_args()
-    
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    
-    results = analyze_read_sizes(args.input_file, args.output, args.expected_wt_size)
-    
-    if results:
-        print("Analysis completed successfully!")
-    else:
-        print("Analysis failed!")
+    print("This module should be imported and used through the main FLT3 ITD detection pipeline.")
+    print("Run 'python main_module.py' instead for command-line usage.")

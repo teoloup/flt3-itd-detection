@@ -656,45 +656,6 @@ def detect_softclip_itds(bam_file: str, reference_sequence: str, reference_file:
 
 
 if __name__ == "__main__":
-    # Test functionality
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Test soft-clip ITD detection")
-    parser.add_argument("bam_file", help="Input BAM file")
-    parser.add_argument("reference_file", help="Reference FASTA file")
-    parser.add_argument("--min-itd-length", type=int, default=15, help="Minimum ITD length")
-    parser.add_argument("--min-support", type=int, default=3, help="Minimum supporting reads")
-    parser.add_argument("--max-itd-length", type=int, default=500, help="Maximum ITD length")
-    parser.add_argument("--min-softclip", type=int, default=50, help="Minimum soft-clip length")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    
-    args = parser.parse_args()
-    
-    # Set up logging
-    log_level = logging.DEBUG if args.debug else logging.INFO
-    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
-    
-    # Read reference sequence
-    with open(args.reference_file, 'r') as f:
-        lines = f.readlines()
-        reference_seq = ''.join(line.strip() for line in lines if not line.startswith('>'))
-    
-    # Detect ITDs
-    candidates = detect_softclip_itds(
-        bam_file=args.bam_file,
-        reference_sequence=reference_seq,
-        reference_file=args.reference_file,
-        min_itd_length=args.min_itd_length,
-        min_support=args.min_support,
-        max_itd_length=args.max_itd_length,
-        min_softclip_length=args.min_softclip
-    )
-    
-    # Print results
-    print(f"\nFound {len(candidates)} soft-clip ITD candidates:")
-    for i, candidate in enumerate(candidates, 1):
-        print(f"{i}. {candidate.length}bp at position {candidate.position}")
-        print(f"   Support: {len(candidate.supporting_reads)} reads")
-        print(f"   Confidence: {candidate.confidence:.3f}")
-        print(f"   Sequence: {candidate.sequence[:50]}...")
-        print()
+    print("This module is part of the FLT3 ITD detection pipeline.")
+    print("Please use main_module.py for command-line execution.")
+    print("This module should be imported and used programmatically.")

@@ -30,16 +30,23 @@ def setup_logging(debug: bool = False):
     return logging.getLogger(__name__)
 
 class FLT3ITDDetector:
-    """Main FLT3 ITD detection pipeline using CIGAR-based approach"""
     
     def __init__(self, config: FLT3Config):
         self.config = config
         self.logger = setup_logging(config.debug)
+        
+        # Create output directory with mkdir -p behavior
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.logger.info(f"Output directory: {self.output_dir}")
         
-        # Track files for cleanup
+        # Create size analysis subdirectory
+        self.size_analysis_dir = self.output_dir / "flt3_size_analysis"
+        self.size_analysis_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Track files for cleanup (only if not in debug mode)
         self.temp_files = []
+        self.keep_temp_files = config.debug
         
     def run(self):
         """Run the complete ITD detection pipeline"""
@@ -90,9 +97,8 @@ class FLT3ITDDetector:
             self.logger.info("\n[Step 4/5] Generating output files...")
             self._write_outputs(result)
             
-            # Step 5: Summary
-            self.logger.info("\n[Step 5/5] Writing summary...")
-            self._write_summary(result)
+            # Step 5: Summary (removed - not needed for default output)
+            # self._write_summary(result)
             
             self.logger.info("\n" + "=" * 60)
             self.logger.info("FLT3 ITD Detection Complete!")
@@ -149,12 +155,23 @@ class FLT3ITDDetector:
             # Run read size analysis
             size_results = analyze_read_sizes(
                 input_file=fastq_file,
-                output_dir=str(self.output_dir),
-                expected_wt_size=self.config.amplicon_length
+                output_dir=str(self.size_analysis_dir),  # Use size analysis subdirectory
+                expected_wt_size=self.config.amplicon_length,
+                wt_tolerance=self.config.wt_tolerance,
+                min_allele_frequency=self.config.min_allele_frequency,
+                sample_name=self.config.sample_name
             )
             
             # Extract ITD sizes from the analysis results
             detected_itd_sizes = []
+
+            # Debug: Log peak detection results
+            if 'peaks' in size_results and size_results['peaks']['peaks']:
+                self.logger.info(f"Read size analysis detected {len(size_results['peaks']['peaks'])} peaks:")
+                for i, peak in enumerate(size_results['peaks']['peaks'][:10]):  # Show first 10 peaks
+                    self.logger.info(f"  Peak {i+1}: {peak['size']:.1f}bp ({peak['height']} reads) - {peak['type']}")
+            else:
+                self.logger.warning("No peaks detected in read size analysis!")
             
             # Method 1: Extract from peaks with ITD type
             if 'peaks' in size_results and 'peaks' in size_results['peaks']:
@@ -269,6 +286,10 @@ class FLT3ITDDetector:
             os.remove(sam_file)
             os.remove(bam_file)
             
+            # Add the final sorted BAM and its index to temp files for cleanup
+            self.temp_files.append(sorted_bam)
+            self.temp_files.append(f"{sorted_bam}.bai")
+            
             self.logger.info(f"Re-alignment completed: {sorted_bam}")
             return sorted_bam
             
@@ -306,60 +327,66 @@ class FLT3ITDDetector:
             raise
     
     def _write_outputs(self, result):
-        """Write VCF and HTML outputs"""
+        """Write default outputs: VCF, HTML, and size analysis files"""
         
         # Convert candidates to legacy format for compatibility
         legacy_results = self._convert_to_legacy_format(result)
         
-        # Write VCF
-        if self.config.write_vcf:
-            vcf_file = self.output_dir / f"{self.config.sample_name}_ITDs.vcf"
-            try:
-                write_vcf_results(
-                    legacy_results, 
-                    self.config.reference_sequence, 
-                    str(vcf_file), 
-                    self.config.sample_name,
-                    genome_chr=self.config.vcf_chr,
-                    genome_start=self.config.vcf_start_pos
-                )
-                self.logger.info(f"VCF written to {vcf_file}")
-            except Exception as e:
-                self.logger.error(f"Failed to write VCF: {e}")
+        # Always write VCF (default output)
+        vcf_file = self.output_dir / f"{self.config.sample_name}_ITDs.vcf"
+        try:
+            write_vcf_results(
+                legacy_results, 
+                self.config.reference_sequence, 
+                str(vcf_file), 
+                self.config.sample_name,
+                genome_chr=self.config.vcf_chr,
+                genome_start=self.config.vcf_start_pos
+            )
+            self.logger.info(f"VCF written to {vcf_file}")
+        except Exception as e:
+            self.logger.error(f"Failed to write VCF: {e}")
         
-        # Write HTML report
-        if self.config.write_html:
-            html_file = self.output_dir / f"{self.config.sample_name}_ITD_report.html"
-            try:
-                generate_html_report(
-                    validation_results=legacy_results,
-                    sample_name=self.config.sample_name,
-                    reference_sequence=self.config.reference_sequence,
-                    total_reads=getattr(self, 'total_reads', 0),
-                    output_file=str(html_file),
-                    size_analysis_results=self.size_analysis_results,
-                    size_analysis_dir=str(self.output_dir)
-                )
-                self.logger.info(f"HTML report written to {html_file}")
-            except Exception as e:
-                self.logger.error(f"Failed to write HTML report: {e}")
+        # Always write HTML report (default output, even if negative)
+        html_file = self.output_dir / f"{self.config.sample_name}_ITD_report.html"
+        try:
+            generate_html_report(
+                validation_results=legacy_results,
+                sample_name=self.config.sample_name,
+                reference_sequence=self.config.reference_sequence,
+                total_reads=getattr(self, 'total_reads', 0),
+                output_file=str(html_file),
+                size_analysis_results=self.size_analysis_results,
+                size_analysis_dir=str(self.size_analysis_dir)  # Point to size analysis subdirectory
+            )
+            self.logger.info(f"HTML report written to {html_file}")
+        except Exception as e:
+            self.logger.error(f"Failed to write HTML report: {e}")
         
-        # Export BAM/FASTA for IGV if requested
+        # Size analysis files are already generated in flt3_size_analysis directory
+        self.logger.info(f"Size analysis files written to {self.size_analysis_dir}")
+        
+        # Export BAM/FASTA for IGV if --bamout is specified
         if self.config.bamout:
-            try:
-                self.logger.info("IGV files already exported during validation process")
-                # The dual reference validator handles IGV export automatically
-                # Check if validation_igv directory exists
-                igv_dir = self.output_dir / "validation_igv"
-                if igv_dir.exists():
-                    igv_files = list(igv_dir.glob("*.bam")) + list(igv_dir.glob("*.fa"))
-                    self.logger.info(f"IGV files available in: {igv_dir}")
-                    for file in igv_files:
-                        self.logger.info(f"  - {file.name}")
-                else:
-                    self.logger.warning("No IGV files were exported during validation")
-            except Exception as e:
-                self.logger.error(f"Failed to report IGV files: {e}")
+            self._export_igv_files(result)
+    
+    def _export_igv_files(self, result):
+        """Export BAM and FASTA files for IGV viewing when --bamout is specified"""
+        try:
+            # Check if bamout files were created during validation
+            bamout_dir = self.output_dir / "bamout"
+            if bamout_dir.exists():
+                self.logger.info(f"BAM validation files created in: {bamout_dir}")
+                # Files are kept in bamout directory for --bamout mode
+                # Don't move them to main output directory
+            else:
+                self.logger.warning("BAM validation files not found. This may be due to:")
+                self.logger.warning("  - Missing samtools (BAM indexing failed)")
+                self.logger.warning("  - BAM file creation issues")
+                self.logger.warning("  - Validation process failure")
+                self.logger.info("Continuing with standard output files (VCF, HTML)")
+        except Exception as e:
+            self.logger.error(f"Failed to export IGV files: {e}")
     
     def _convert_to_legacy_format(self, result):
         """Convert new pipeline results to legacy format for VCF/HTML writers"""
@@ -385,15 +412,25 @@ class FLT3ITDDetector:
             class LegacyValidation:
                 def __init__(self, cand, val):
                     self.itd_candidate = LegacyCandidate(cand)
-                    self.is_valid = val.is_valid if val else True
-                    self.validation_confidence = val.validation_confidence if val else cand.confidence
-                    self.allele_frequency = val.allele_frequency if val else 0.1
                     
                     # Handle supporting_reads being either int or list
                     support_count = cand.supporting_reads if isinstance(cand.supporting_reads, int) else len(cand.supporting_reads)
                     
-                    self.total_coverage = val.total_coverage if val else support_count * 2
-                    self.itd_coverage = val.itd_coverage if val else support_count
+                    # Handle both object and dict validation results
+                    if isinstance(val, dict):
+                        self.is_valid = val.get('is_valid', val.get('passed', True))
+                        self.validation_confidence = val.get('validation_confidence', cand.confidence)
+                        self.allele_frequency = val.get('allele_frequency', 0.1)
+                        self.total_coverage = val.get('total_coverage', val.get('total_reads_processed', support_count * 2))
+                        self.itd_coverage = val.get('itd_coverage', val.get('supporting_reads', support_count))
+                    else:
+                        # Original object-based validation results
+                        self.is_valid = val.is_valid if val else True
+                        self.validation_confidence = val.validation_confidence if val else cand.confidence
+                        self.allele_frequency = val.allele_frequency if val else 0.1
+                        self.total_coverage = val.total_coverage if val else support_count * 2
+                        self.itd_coverage = val.itd_coverage if val else support_count
+                    
                     self.insertion_position = cand.position
                     self.duplication_length = cand.length
                     self.duplication_start = getattr(cand, 'duplication_start', None)
@@ -489,21 +526,34 @@ class FLT3ITDDetector:
         self.logger.info(f"Summary written to {summary_file}")
     
     def _write_empty_results(self):
-        """Write empty results when no ITDs found"""
-        # Empty VCF
-        if self.config.write_vcf:
-            vcf_file = self.output_dir / f"{self.config.sample_name}_ITDs.vcf"
-            write_vcf_results([], self.config.reference_sequence, str(vcf_file), 
+        """Write default outputs when no ITDs found"""
+        # Always write VCF (default output, even if empty)
+        vcf_file = self.output_dir / f"{self.config.sample_name}_ITDs.vcf"
+        try:
+            write_vcf_results([], self.config.reference_sequence, str(vcf_file),
                              self.config.sample_name, genome_chr=self.config.vcf_chr,
                              genome_start=self.config.vcf_start_pos)
-        
-        # Empty summary
-        summary_file = self.output_dir / f"{self.config.sample_name}_summary.txt"
-        with open(summary_file, 'w') as f:
-            f.write(f"FLT3 ITD Detection Summary - {self.config.sample_name}\\n")
-            f.write(f"Analysis Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\\n")
-            f.write(f"Pipeline: CIGAR-based ITD detection\\n")
-            f.write("\\nNo ITDs detected.\\n")
+            self.logger.info(f"Empty VCF written to {vcf_file}")
+        except Exception as e:
+            self.logger.error(f"Failed to write empty VCF: {e}")
+
+        # Always write HTML report (default output, even if negative)
+        html_file = self.output_dir / f"{self.config.sample_name}_ITD_report.html"
+        try:
+            generate_html_report(
+                validation_results=[],
+                sample_name=self.config.sample_name,
+                reference_sequence=self.config.reference_sequence,
+                total_reads=getattr(self, 'total_reads', 0),
+                output_file=str(html_file),
+                size_analysis_results=self.size_analysis_results,
+                size_analysis_dir=str(self.size_analysis_dir)
+            )
+            self.logger.info(f"HTML report written to {html_file}")
+        except Exception as e:
+            self.logger.error(f"Failed to write HTML report: {e}")
+
+        # Summary file removed - not needed for default output
     
     def _cleanup(self):
         """Clean up temporary files"""
@@ -511,8 +561,20 @@ class FLT3ITDDetector:
             for temp_file in self.temp_files:
                 try:
                     if Path(temp_file).exists():
-                        Path(temp_file).unlink()
+                        # If it's a file in a temp directory, also try to clean up the directory
+                        temp_path = Path(temp_file)
+                        temp_path.unlink()
                         self.logger.debug(f"Cleaned up: {temp_file}")
+                        
+                        # Try to clean up the parent directory if it's a temp directory
+                        parent_dir = temp_path.parent
+                        if parent_dir.name.startswith(('flt3_cutadapt_', 'tmp')) and parent_dir.exists():
+                            try:
+                                import shutil
+                                shutil.rmtree(parent_dir)
+                                self.logger.debug(f"Cleaned up temp directory: {parent_dir}")
+                            except Exception as e:
+                                self.logger.warning(f"Failed to cleanup temp directory {parent_dir}: {e}")
                 except Exception as e:
                     self.logger.warning(f"Failed to cleanup {temp_file}: {e}")
 

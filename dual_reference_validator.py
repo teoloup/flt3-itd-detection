@@ -466,19 +466,19 @@ class DualReferenceValidator:
         try:
             # Determine output directory
             output_dir = getattr(self.config, 'output_dir', '.')
-            igv_dir = Path(output_dir) / "validation_igv"
-            igv_dir.mkdir(parents=True, exist_ok=True)
+            bamout_dir = Path(output_dir) / "bamout"
+            bamout_dir.mkdir(parents=True, exist_ok=True)
             
             # Create unique prefix
             prefix = f"itd_{itd_candidate.length}bp_pos{itd_candidate.position}_dual_ref"
             
             # Copy reference file
-            ref_dest = igv_dir / f"{prefix}.fa"
+            ref_dest = bamout_dir / f"{prefix}.fa"
             shutil.copy2(dual_ref_file, ref_dest)
             
             # Copy and rename BAM file (with integrity check)
-            bam_dest = igv_dir / f"{prefix}.bam"
-            bai_dest = igv_dir / f"{prefix}.bam.bai"
+            bam_dest = bamout_dir / f"{prefix}.bam"
+            bai_dest = bamout_dir / f"{prefix}.bam.bai"
             
             # Verify BAM file integrity before copying using samtools
             try:
@@ -525,7 +525,7 @@ class DualReferenceValidator:
                     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
                         logger.warning(f"Failed to create BAM index: {e}")
                 
-                logger.info(f"Exported validation files to {igv_dir}: {ref_dest.name}, {bam_dest.name}")
+                logger.info(f"Exported validation files to {bamout_dir}: {ref_dest.name}, {bam_dest.name}")
                 
             except Exception as e:
                 logger.error(f"Failed to copy BAM file: {e}")
@@ -619,57 +619,5 @@ def validate_itd_candidates_dual_reference(candidates: List['ITDCandidate'],
 
 
 if __name__ == "__main__":
-    # Test functionality
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Test dual-reference ITD validation")
-    parser.add_argument("fastq_file", help="Input FASTQ file with reads")
-    parser.add_argument("reference_file", help="Reference FASTA file")
-    parser.add_argument("--itd-sequence", required=True, help="ITD sequence to test")
-    parser.add_argument("--itd-position", type=int, required=True, help="ITD insertion position")
-    parser.add_argument("--min-support", type=int, default=3, help="Minimum supporting reads")
-    parser.add_argument("--min-af", type=float, default=0.01, help="Minimum allele frequency")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    
-    args = parser.parse_args()
-    
-    # Set up logging
-    log_level = logging.DEBUG if args.debug else logging.INFO
-    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
-    
-    # Read reference sequence
-    with open(args.reference_file, 'r') as f:
-        lines = f.readlines()
-        reference_seq = ''.join(line.strip() for line in lines if not line.startswith('>'))
-    
-    # Create test ITD candidate
-    from cigar_itd_detector import ITDCandidate
-    test_candidate = ITDCandidate(
-        sequence=args.itd_sequence,
-        length=len(args.itd_sequence),
-        position=args.itd_position,
-        support_type='test',
-        supporting_reads=['test_read'],
-        confidence=0.8,
-        insertion_site=args.itd_position
-    )
-    
-    # Validate ITD
-    results = validate_itd_candidates_dual_reference(
-        candidates=[test_candidate],
-        reference_sequence=reference_seq,
-        reads_fastq=args.fastq_file,
-        min_supporting_reads=args.min_support,
-        min_allele_frequency=args.min_af
-    )
-    
-    # Print results
-    if results:
-        print(f"Validation successful:")
-        for result in results:
-            print(f"  ITD: {result.duplication_length}bp")
-            print(f"  Allele frequency: {result.allele_frequency:.3f}")
-            print(f"  Supporting reads: {result.itd_coverage}")
-            print(f"  Confidence: {result.validation_confidence:.3f}")
-    else:
-        print("Validation failed - no valid ITDs found")
+    print("This module should be imported and used through the main FLT3 ITD detection pipeline.")
+    print("Run 'python main_module.py' instead for command-line usage.")

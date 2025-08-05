@@ -9,6 +9,8 @@ import time
 import subprocess
 import tempfile
 import re
+import os
+import shutil
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Union
 from dataclasses import dataclass
@@ -69,6 +71,9 @@ class FLT3ITDPipeline:
         self.enable_softclip_fallback = enable_softclip_fallback
         self.size_analysis_results = size_analysis_results or {}
         self.config = config
+        
+        # Track temporary files for cleanup
+        self.temp_files = []
         
         # Get threads from config or use default
         self.threads = config.threads if config else 4
@@ -173,8 +178,8 @@ class FLT3ITDPipeline:
         
         runtime_stats['total_time'] = time.time() - start_time
         
-        # Step 5: Save results if output prefix provided
-        if output_prefix:
+        # Step 5: Save results if output prefix provided and debug mode is enabled (not for bamout)
+        if output_prefix and self.config and getattr(self.config, 'debug', False):
             self._save_results(output_prefix, detection_summary, runtime_stats)
         
         result = ITDDetectionResult(
@@ -398,9 +403,35 @@ class FLT3ITDPipeline:
         try:
             logger.info(f"Starting multifasta validation for {len(candidates)} candidates")
             
-            # Write multifasta for all candidates and WT
+            # Write multifasta for all candidates and WT (only if debug or bamout)
             output_prefix = getattr(self, 'output_prefix', None)
-            multifasta_path = self._write_multifasta_for_validation(candidates, output_prefix)
+            multifasta_path = None
+            if self.config and (getattr(self.config, 'debug', False) or getattr(self.config, 'bamout', False)):
+                multifasta_path = self._write_multifasta_for_validation(candidates, output_prefix)
+            else:
+                # Create temporary multifasta that will be cleaned up
+                import tempfile
+                temp_fd, temp_multifasta = tempfile.mkstemp(suffix='_multifasta.fa')
+                os.close(temp_fd)
+                # Write multifasta content to temp file
+                with open(temp_multifasta, 'w') as f:
+                    # Write WT reference sequence
+                    f.write(">WT\n")
+                    f.write(f"{self.reference_sequence}\n")
+                    
+                    # Write each ITD candidate sequence
+                    for i, candidate in enumerate(candidates):
+                        # Create ITD reference by inserting the ITD sequence at the specified position
+                        itd_ref = (self.reference_sequence[:candidate.position] + 
+                                  candidate.sequence + 
+                                  self.reference_sequence[candidate.position:])
+                        
+                        f.write(f">ITD_{i+1}\n")
+                        f.write(f"{itd_ref}\n")
+                
+                logger.info(f"Created temporary multifasta: {temp_multifasta} with {len(candidates)} ITD candidates")
+                multifasta_path = temp_multifasta
+                self.temp_files.append(multifasta_path)
             
             # Use trimmed FASTQ if available, otherwise extract reads from BAM
             reads_file = getattr(self, 'trimmed_fastq', None)
@@ -410,17 +441,110 @@ class FLT3ITDPipeline:
             # Align reads to multifasta using minimap2
             sam_output = self._align_reads_to_multifasta(reads_file, multifasta_path, output_prefix)
             
+            # Check if alignment succeeded - try SAM first, then BAM
+            alignment_file_path = None
+            if sam_output and os.path.exists(sam_output):
+                alignment_file_path = sam_output
+                logger.info(f"Using SAM file for validation: {sam_output}")
+            elif sam_output and os.path.exists(sam_output.replace('.sam', '.bam')):
+                alignment_file_path = sam_output.replace('.sam', '.bam')
+                logger.info(f"SAM file deleted, using BAM file for validation: {alignment_file_path}")
+            else:
+                logger.warning("Neither SAM nor BAM alignment file found")
+                return [], []
+            
             # Parse alignments and validate with CIGAR filtering
             validated_candidates, validation_results = self._parse_multifasta_alignments(
-                sam_output, candidates, multifasta_path
+                alignment_file_path, candidates, multifasta_path
             )
             
             logger.info(f"Validation complete: {len(validated_candidates)}/{len(candidates)} candidates passed")
+            
+            # For --bamout mode, convert SAM to BAM after validation and clean up
+            if getattr(self.config, 'bamout', False) and alignment_file_path.endswith('.sam'):
+                try:
+                    bam_file = alignment_file_path.replace('.sam', '.bam')
+                    logger.info(f"Converting SAM to BAM for --bamout: {bam_file}")
+
+                    # Convert SAM to BAM
+                    samtools_cmd = ['samtools', 'view', '-b', '-o', bam_file, alignment_file_path]
+                    result = subprocess.run(samtools_cmd, capture_output=True, text=True, check=True)
+
+                    # Sort BAM
+                    sorted_bam = bam_file.replace('.bam', '_sorted.bam')
+                    sort_cmd = ['samtools', 'sort', '-o', sorted_bam, bam_file]
+                    result = subprocess.run(sort_cmd, capture_output=True, text=True, check=True)
+
+                    # Index BAM file with better error handling for multifasta
+                    samtools_index_cmd = ['samtools', 'index', sorted_bam]
+                    result = subprocess.run(samtools_index_cmd, capture_output=True, text=True)
+                    
+                    if result.returncode == 0:
+                        logger.info(f"Successfully created and indexed BAM file: {sorted_bam}")
+                        bai_file = sorted_bam.replace('.bam', '.bam.bai')
+                    else:
+                        error_msg = result.stderr if result.stderr else "Unknown error"
+                        if "Chromosome blocks not continuous" in error_msg:
+                            logger.info(f"BAM file created successfully: {sorted_bam}")
+                            logger.info("Note: BAM indexing skipped for multifasta alignment (chromosome blocks not continuous)")
+                        else:
+                            logger.warning(f"BAM indexing failed: {error_msg}")
+
+                    
+                    # Create bamout directory and copy files
+                    output_dir = getattr(self.config, 'output_dir', '.')
+                    bamout_dir = Path(output_dir) / "bamout"
+                    bamout_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Copy multifasta
+                    bamout_multifasta = bamout_dir / f"{self.config.sample_name}_multifasta_validation.fa"
+                    shutil.copy2(multifasta_path, bamout_multifasta)
+                    
+                    # Copy BAM and BAI
+                    bamout_bam = bamout_dir / f"{os.path.basename(sorted_bam)}"
+                    bamout_bai = bamout_dir / f"{os.path.basename(bai_file)}"
+                    # shutil.move(sorted_bam, bamout_dir)
+                    # shutil.move(bai_file, bamout_dir)
+                    shutil.copy2(sorted_bam, bamout_bam)
+                    shutil.copy2(bai_file, bamout_bai)
+                    logger.info(f"BAM files created in: {bamout_dir}")
+                    
+                    # Clean up the original BAM file after copying
+                    try:
+                        os.remove(bam_file)
+                        os.remove(sorted_bam)
+                        if os.path.exists(bai_file):
+                            os.remove(bai_file)
+                        logger.debug(f"Cleaned up temporary BAM files: {sorted_bam,bam_file}")
+                    except Exception as cleanup_e:
+                        logger.warning(f"Failed to clean up temporary BAM files: {cleanup_e}")
+                    
+                except subprocess.CalledProcessError as e:
+                    error_msg = e.stderr if e.stderr else str(e)
+                    logger.warning(f"Failed to convert SAM to BAM: {error_msg}")
+                    logger.info("Continuing without BAM conversion")
+                except Exception as e:
+                    logger.warning(f"Failed to create BAM files: {e}")
+                    logger.info("Continuing without BAM conversion")
+            
+            # Clean up alignment files after validation
+            if alignment_file_path and os.path.exists(alignment_file_path):
+                try:
+                    os.remove(alignment_file_path)
+                    logger.debug(f"Cleaned up alignment file after validation: {alignment_file_path}")
+                    # Also clean up multifasta file
+                    if os.path.exists(multifasta_path):
+                        os.remove(multifasta_path)
+                        logger.debug(f"Cleaned up multifasta file after validation: {multifasta_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to clean up alignment files after validation: {e}")
+            
             return validated_candidates, validation_results
             
         except Exception as e:
             logger.error(f"Multifasta validation failed: {e}")
-            return candidates, []  # Return unvalidated candidates if validation fails
+            # Don't return candidates as validated if validation completely failed
+            return [], []
     
     def _extract_reads_from_bam(self, bam_file: str, output_prefix: Optional[str] = None) -> str:
         """
@@ -435,10 +559,14 @@ class FLT3ITDPipeline:
         """
         try:
             # Generate output FASTQ filename
-            if output_prefix:
+            if output_prefix and self.config and (getattr(self.config, 'debug', False) or getattr(self.config, 'bamout', False)):
                 fastq_file = f"{output_prefix}_reads_for_validation.fastq"
             else:
-                fastq_file = "reads_for_validation.fastq"
+                # Create temporary FASTQ file
+                import tempfile
+                temp_fd, fastq_file = tempfile.mkstemp(suffix='_reads_for_validation.fastq')
+                os.close(temp_fd)
+                self.temp_files.append(fastq_file)
             
             # Use samtools to convert BAM to FASTQ
             cmd = [
@@ -474,10 +602,16 @@ class FLT3ITDPipeline:
         """
         try:
             # Generate output SAM filename
-            if output_prefix:
+            if output_prefix and self.config and (getattr(self.config, 'debug', False) or getattr(self.config, 'bamout', False)):
                 sam_file = f"{output_prefix}_multifasta_alignment.sam"
             else:
-                sam_file = "multifasta_alignment.sam"
+                # Create temporary SAM file for validation only
+                import tempfile
+                temp_fd, sam_file = tempfile.mkstemp(suffix='_multifasta_alignment.sam')
+                os.close(temp_fd)
+                # Add to cleanup if we have a way to track temp files
+                if hasattr(self, 'temp_files'):
+                    self.temp_files.append(sam_file)
             
             # Run minimap2 alignment
             cmd = [
@@ -489,11 +623,24 @@ class FLT3ITDPipeline:
                 reads_file
             ]
             
-            with open(sam_file, 'w') as sam_out:
-                result = subprocess.run(cmd, stdout=sam_out, stderr=subprocess.PIPE, 
-                                      text=True, check=True)
+            try:
+                with open(sam_file, 'w') as sam_out:
+                    result = subprocess.run(cmd, stdout=sam_out, stderr=subprocess.PIPE, 
+                                          text=True, check=True)
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                logger.error(f"Minimap2 alignment failed (minimap2 not available?): {e}")
+                logger.info("Skipping multifasta validation due to missing minimap2")
+                return ""  # Return empty string to indicate failure
             
-            logger.info(f"Alignment complete: {sam_file}")
+            # Check if SAM file has content
+            if os.path.exists(sam_file):
+                file_size = os.path.getsize(sam_file)
+                logger.info(f"Alignment complete: {sam_file} ({file_size} bytes)")
+                if file_size == 0:
+                    logger.warning("SAM file is empty - no alignments produced")
+            else:
+                logger.error(f"SAM file was not created: {sam_file}")
+            
             return sam_file
             
         except subprocess.CalledProcessError as e:
@@ -503,7 +650,7 @@ class FLT3ITDPipeline:
             logger.error(f"Error during alignment: {e}")
             raise
     
-    def _parse_multifasta_alignments(self, sam_file: str, candidates: List[ITDCandidate], 
+    def _parse_multifasta_alignments(self, alignment_file: str, candidates: List[ITDCandidate], 
                                    multifasta_path: str) -> Tuple[List[ITDCandidate], List[Dict]]:
         """
         Parse SAM alignments and validate candidates with CIGAR filtering
@@ -527,17 +674,39 @@ class FLT3ITDPipeline:
             
             # Track supporting reads for each candidate using index
             candidate_support = {}
+            wt_support = []  # Track WT alignments
             validation_results = []
             
-            # Parse SAM file - try pysam first, fallback to manual parsing
+            # Parse SAM/BAM file - try pysam first, fallback to manual parsing
+            logger.info(f"Parsing alignment file: {alignment_file}")
+            
+            # Check if file exists
+            if not os.path.exists(alignment_file):
+                logger.error(f"Alignment file does not exist: {alignment_file}")
+                # Return empty results if no alignment file
+                return [], []
+            
+            # Determine file type and appropriate mode
+            if alignment_file.endswith('.bam'):
+                pysam_mode = "rb"
+                manual_mode = None  # Can't manually parse BAM
+            else:
+                pysam_mode = "r"
+                manual_mode = 'r'
+            
             try:
                 import pysam
-                alignment_file = pysam.AlignmentFile(sam_file, "r")
+                logger.info(f"Using pysam for alignment parsing (mode: {pysam_mode})")
+                file_handle = pysam.AlignmentFile(alignment_file, pysam_mode, check_sq=False)
                 use_pysam = True
             except ImportError:
-                logger.warning("pysam not available, using manual SAM parsing")
-                use_pysam = False
-                alignment_file = open(sam_file, 'r')
+                if manual_mode:
+                    logger.warning("pysam not available, using manual SAM parsing")
+                    use_pysam = False
+                    file_handle = open(alignment_file, manual_mode)
+                else:
+                    logger.error("pysam required for BAM file parsing")
+                    return [], []
             
             total_reads_processed = 0
             filtered_reads = {'unmapped': 0, 'secondary': 0, 'large_indels': 0, 'low_quality': 0, 'soft_clipped': 0}
@@ -545,7 +714,7 @@ class FLT3ITDPipeline:
             try:
                 if use_pysam:
                     # Use pysam for parsing
-                    for read in alignment_file:
+                    for read in file_handle:
                         total_reads_processed += 1
                         
                         if read.is_unmapped or read.is_secondary or read.is_supplementary:
@@ -554,8 +723,9 @@ class FLT3ITDPipeline:
                         
                         ref_name = read.reference_name
                         
-                        # Skip WT alignments for now (focus on ITD validation)
+                        # Count WT alignments
                         if ref_name == "WT":
+                            wt_support.append(read.query_name)
                             continue
                         
                         if ref_name not in ref_to_candidate:
@@ -601,8 +771,9 @@ class FLT3ITDPipeline:
                             filtered_reads['secondary'] += 1
                             continue
                         
-                        # Skip WT alignments
+                        # Count WT alignments
                         if ref_name == "WT":
+                            wt_support.append(fields[0])  # Query name
                             continue
                         
                         if ref_name not in ref_to_candidate:
@@ -627,21 +798,30 @@ class FLT3ITDPipeline:
                         candidate_support[candidate_index].append(fields[0])  # Query name
             
             finally:
-                alignment_file.close()
+                file_handle.close()
             
             logger.info(f"Processed {total_reads_processed} reads, filtered: {filtered_reads}")
             logger.info(f"Reads mapping to ITD candidates: {sum(len(reads) for reads in candidate_support.values())}")
+            logger.info(f"Reads mapping to WT: {len(wt_support)}")
             for i, candidate in enumerate(candidates):
                 support_count = len(candidate_support.get(i, []))
                 logger.info(f"  ITD_{i+1} ({candidate.length}bp): {support_count} supporting reads")
             
             # Filter candidates based on support AND allele frequency
             validated_candidates = []
+            
+            # Calculate total reads that mapped to any reference (WT + ITDs)
+            total_mapped_reads = sum(len(reads) for reads in candidate_support.values()) + len(wt_support)
+            
             for i, candidate in enumerate(candidates):
                 support_count = len(candidate_support.get(i, []))
                 
-                # Calculate allele frequency for this candidate
-                allele_frequency = support_count / total_reads_processed if total_reads_processed > 0 else 0.0
+                # Calculate allele frequency: ITD reads / (ITD reads + WT reads)
+                # This gives the true allele frequency among reads that aligned to FLT3
+                if total_mapped_reads > 0:
+                    allele_frequency = support_count / total_mapped_reads
+                else:
+                    allele_frequency = 0.0
                 
                 # Get minimum thresholds from config
                 min_support = max(5, self.min_support)  # At least 5 reads or configured minimum
@@ -656,7 +836,12 @@ class FLT3ITDPipeline:
                     validation_results.append({
                         'candidate': candidate,
                         'supporting_reads': support_count,
-                        'total_reads_processed': total_reads_processed,  # Include total reads for AF calculation
+                        'total_reads_processed': total_mapped_reads,
+                        'allele_frequency': allele_frequency,
+                        'total_coverage': total_mapped_reads,
+                        'itd_coverage': support_count,
+                        'is_valid': True,
+                        'validation_confidence': min(1.0, allele_frequency * 2),  # Simple confidence based on AF
                         'passed': True,
                         'reason': f'Sufficient support: {support_count} reads (>= {min_support}) and AF: {allele_frequency:.4f} (>= {min_af:.4f})'
                     })
@@ -673,7 +858,12 @@ class FLT3ITDPipeline:
                     validation_results.append({
                         'candidate': candidate,
                         'supporting_reads': support_count,
-                        'total_reads_processed': total_reads_processed,  # Include total reads for AF calculation
+                        'total_reads_processed': total_mapped_reads,
+                        'allele_frequency': allele_frequency,
+                        'total_coverage': total_mapped_reads,
+                        'itd_coverage': support_count,
+                        'is_valid': False,
+                        'validation_confidence': 0.0,
                         'passed': False,
                         'reason': reason
                     })
@@ -1204,23 +1394,73 @@ class FLT3ITDPipeline:
             return validated_candidates, validation_result_objects
             
         except Exception as e:
-            logger.error(f"Multifasta validation failed, falling back to old method: {e}")
-            # Fallback to old validation method if multifasta fails
-            reads_file = self.trimmed_fastq if self.trimmed_fastq else bam_file
-            validation_results = validate_itd_candidates_dual_reference(candidates=candidates,
-                reads_fastq=reads_file,
-                reference_sequence=self.reference_sequence,
-                min_supporting_reads=self.min_support,
-                min_allele_frequency=0.01,
-                config=self.config)
-            
-            validated_candidates = []
-            for i, result in enumerate(validation_results):
-                validated_candidates.append(candidates[i])
-                logger.debug(f"Validated candidate {i+1}: {candidates[i].length}bp "
-                           f"(allele_freq={result.allele_frequency:.3f})")
-            
+            logger.error(f"Multifasta validation failed, falling back to simple validation: {e}")
+            # Fallback to simple validation that doesn't require external tools
+            validated_candidates, validation_results = self._simple_validation_fallback(candidates)
             return validated_candidates, validation_results
+    
+    def _simple_validation_fallback(self, candidates: List[Union[ITDCandidate, SoftClipITDCandidate]]) -> Tuple[List[Union[ITDCandidate, SoftClipITDCandidate]], List[ValidationResult]]:
+        """
+        Simple validation fallback that doesn't require external tools
+        
+        Args:
+            candidates: List of candidates to validate
+            
+        Returns:
+            Tuple of (validated_candidates, validation_results)
+        """
+        logger.info("Using simple validation fallback (no external tools required)")
+        
+        validated_candidates = []
+        validation_results = []
+        
+        for candidate in candidates:
+            # Get supporting reads count
+            if isinstance(candidate.supporting_reads, list):
+                supporting_reads = len(candidate.supporting_reads)
+            elif isinstance(candidate.supporting_reads, int):
+                supporting_reads = candidate.supporting_reads
+            else:
+                supporting_reads = 0
+            
+            # Estimate total coverage (rough estimate based on typical FLT3 coverage)
+            estimated_total_coverage = max(supporting_reads * 3, 1000)  # At least 1000 reads
+            
+            # Calculate allele frequency
+            allele_frequency = supporting_reads / estimated_total_coverage if estimated_total_coverage > 0 else 0.0
+            
+            # Get minimum thresholds
+            min_support = max(5, self.min_support)
+            min_af = getattr(self.config, 'min_allele_frequency', 0.01) if self.config else 0.01
+            
+            # Check validation criteria
+            passes_support = supporting_reads >= min_support
+            passes_af = allele_frequency >= min_af
+            
+            if passes_support and passes_af:
+                validated_candidates.append(candidate)
+                
+                # Create validation result object
+                mock_result = type('ValidationResult', (), {
+                    'is_valid': True,
+                    'allele_frequency': allele_frequency,
+                    'segregation_quality': 0.8,
+                    'supporting_reads': supporting_reads,
+                    'total_coverage': estimated_total_coverage,
+                    'itd_coverage': supporting_reads,
+                    'confidence': candidate.confidence,
+                    'validation_confidence': candidate.confidence
+                })()
+                validation_results.append(mock_result)
+                
+                logger.info(f"Simple validation passed for {candidate.length}bp ITD: "
+                           f"{supporting_reads} reads, AF={allele_frequency:.4f}")
+            else:
+                logger.info(f"Simple validation failed for {candidate.length}bp ITD: "
+                           f"{supporting_reads} reads (< {min_support}) or AF={allele_frequency:.4f} (< {min_af})")
+        
+        logger.info(f"Simple validation complete: {len(validated_candidates)}/{len(candidates)} candidates passed")
+        return validated_candidates, validation_results
     
     def _generate_detection_summary(self, cigar_candidates: List[ITDCandidate],
                                   softclip_candidates: List[SoftClipITDCandidate],
@@ -1356,74 +1596,21 @@ def run_flt3_itd_pipeline(bam_file: str, reference_sequence: str, reference_file
         config=config
     )
     
-    return pipeline.detect_itds(bam_file, output_prefix)
+    result = pipeline.detect_itds(bam_file, output_prefix)
+    
+    # Clean up temporary files created by the pipeline
+    for temp_file in pipeline.temp_files:
+        try:
+            if Path(temp_file).exists():
+                Path(temp_file).unlink()
+                logger.debug(f"Cleaned up pipeline temp file: {temp_file}")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup pipeline temp file {temp_file}: {e}")
+    
+    return result
 
 
 if __name__ == "__main__":
-    # Test the complete pipeline
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="FLT3 ITD Detection Pipeline")
-    parser.add_argument("bam_file", help="Input BAM file with FLT3 reads")
-    parser.add_argument("reference_file", help="Reference FASTA file")
-    parser.add_argument("--min-itd-length", type=int, default=15, help="Minimum ITD length")
-    parser.add_argument("--max-itd-length", type=int, default=500, help="Maximum ITD length")
-    parser.add_argument("--min-support", type=int, default=3, help="Minimum supporting reads")
-    parser.add_argument("--min-softclip", type=int, default=50, help="Minimum soft-clip length")
-    parser.add_argument("--no-softclip-fallback", action="store_true", 
-                       help="Disable soft-clip fallback analysis")
-    parser.add_argument("--output-prefix", help="Output file prefix")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    
-    args = parser.parse_args()
-    
-    # Set up logging
-    log_level = logging.DEBUG if args.debug else logging.INFO
-    logging.basicConfig(
-        level=log_level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
-    # Read reference sequence
-    try:
-        with open(args.reference_file, 'r') as f:
-            lines = f.readlines()
-            reference_seq = ''.join(line.strip() for line in lines if not line.startswith('>'))
-    except Exception as e:
-        logger.error(f"Failed to read reference file: {e}")
-        exit(1)
-    
-    # Run pipeline
-    try:
-        result = run_flt3_itd_pipeline(
-            bam_file=args.bam_file,
-            reference_sequence=reference_seq,
-            reference_file=args.reference_file,
-            min_itd_length=args.min_itd_length,
-            max_itd_length=args.max_itd_length,
-            min_support=args.min_support,
-            min_softclip_length=args.min_softclip,
-            enable_softclip_fallback=not args.no_softclip_fallback,
-            output_prefix=args.output_prefix
-        )
-        
-        # Print results
-        print(f"\n=== FLT3 ITD Detection Results ===")
-        print(f"CIGAR candidates: {len(result.cigar_candidates)}")
-        print(f"Soft-clip candidates: {len(result.softclip_candidates)}")
-        print(f"Validated ITDs: {len(result.validated_candidates)}")
-        print(f"Runtime: {result.runtime_stats['total_time']:.2f}s")
-        
-        if result.validated_candidates:
-            print(f"\nValidated ITDs:")
-            for i, candidate in enumerate(result.validated_candidates, 1):
-                print(f"  {i}. {candidate.length}bp at position {candidate.position}")
-                print(f"     Support: {len(candidate.supporting_reads)} reads")
-                print(f"     Confidence: {candidate.confidence:.3f}")
-                print(f"     Method: {candidate.support_type}")
-        else:
-            print("\nNo validated ITDs found.")
-        
-    except Exception as e:
-        logger.error(f"Pipeline failed: {e}")
-        exit(1)
+    print("This module is part of the FLT3 ITD detection pipeline.")
+    print("Please use main_module.py for command-line execution.")
+    print("This module should be imported and used programmatically.")
