@@ -101,14 +101,6 @@ python main_module.py -b sample.bam -o results/ -n Sample001 \
 5. **CIGAR Filtering**: Filter reads with poor alignment quality
 6. **Report Generation**: Create comprehensive reports and visualizations
 
-## Citation
-
-If you use this pipeline in your research, please cite:
-
-```
-[Your paper citation here]
-```
-
 ## License
 
 MIT License - see LICENSE file for details.
